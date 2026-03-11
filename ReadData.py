@@ -13,12 +13,12 @@ import open3d as o3d
 
 #! 生成相机所在的位置，参数为球坐标的三个参数。
 def pose_spherical(theta, phi, radius):
-
+    # 平移矩阵
     def trans_t(t):
         return torch.Tensor(
             [[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, t], [0, 0, 0, 1]]
         ).float()
-
+    # 旋转矩阵,绕x轴旋转phi度
     def rot_phi(phi):
         return torch.Tensor(
             [
@@ -28,7 +28,7 @@ def pose_spherical(theta, phi, radius):
                 [0, 0, 0, 1],
             ]
         ).float()
-
+    # 旋转矩阵,绕y轴旋转theta度
     def rot_theta(th):
         return torch.Tensor(
             [
