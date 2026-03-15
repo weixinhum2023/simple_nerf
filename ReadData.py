@@ -123,7 +123,32 @@ def load_blender_data(basedir, testskip=1):
     # plt.axis('off')
     # plt.show()
 
-    return imgs, poses, int(H), int(W), focal, i_split
+    #? 直接预计算每张图像对应的rays_o、rays_d和rgbs，便于训练阶段直接采样。
+    K = np.array([[focal, 0, 0.5 * W], [0, focal, 0.5 * H], [0, 0, 1]], dtype=np.float32)
+    K_t = torch.from_numpy(K).float()
+    poses_t = torch.from_numpy(poses).float()
+
+    rays_o_all = []
+    rays_d_all = []
+    rgbs_all = []
+    for idx in range(imgs.shape[0]):
+        img_t = torch.from_numpy(imgs[idx]).float()
+        pose_t = poses_t[idx, :3, :4]
+        rays_o, rays_d, rgbs = process_image_to_rays(img_t, pose_t, K_t)
+        rays_o_all.append(rays_o)
+        rays_d_all.append(rays_d)
+        rgbs_all.append(rgbs)
+
+    rays_o_all = torch.stack(rays_o_all, dim=0)
+    rays_d_all = torch.stack(rays_d_all, dim=0)
+    rgbs_all = torch.stack(rgbs_all, dim=0)
+
+    # 将数据放到GPU上，便于后续训练使用
+    rays_o_all = rays_o_all.to(torch.float32)
+    rays_d_all = rays_d_all.to(torch.float32)
+    rgbs_all = rgbs_all.to(torch.float32)
+
+    return int(H), int(W), i_split, rays_o_all, rays_d_all, rgbs_all
 
 
 #! 生成相机渲染视角，用于生成训练之后的视频，参数num_poses表示生成的视角数量，radius表示相机距离原点的距离。
@@ -184,11 +209,11 @@ def print_library_versions():
 
 # 依据图像的高、宽、相机内参矩阵和相机外参矩阵，生成每个像素对应的光线起点和方向。
 def get_rays(H, W, K, c2w):
-    i, j = torch.meshgrid(
-        torch.linspace(0, W - 1, W), torch.linspace(0, H - 1, H), indexing="ij"
-    )  # pytorch's meshgrid has indexing='ij'
-    i = i.t()
-    j = j.t()
+    j, i = torch.meshgrid(
+        torch.linspace(0, H - 1, H, device=K.device, dtype=K.dtype),
+        torch.linspace(0, W - 1, W, device=K.device, dtype=K.dtype),
+        indexing="ij",
+    )  # 直接生成与图像一致的(H, W)坐标网格，无需再转置
     # 把相机中心当原点，成像平面放在 (z=-f)。
     # 像素 ((u,v)) 先减主点 ((c_x,c_y))，得到相对光轴的偏移。
     # 再除以焦距作用是z直接等于-1，得到相机坐标系下的光线方向。y前面加了负号是因为图像坐标系的y轴是向下的，而相机坐标系的y轴是向上的，所以需要取反。
@@ -199,6 +224,9 @@ def get_rays(H, W, K, c2w):
     rays_d = torch.sum(
         dirs[..., np.newaxis, :] * c2w[:3, :3], -1
     )  # dot product, equals to: [c2w.dot(dir) for dir in dirs]
+    # 将rays_d进行归一化，得到单位向量形式的光线方向。
+    rays_d = rays_d / torch.norm(rays_d, dim=-1, keepdim=True)
+
     # Translate camera frame's origin to the world frame. It is the origin of all rays.
     # 这里的c2w[:3,-1]是相机外参矩阵中的平移部分，表示相机在世界坐标系中的位置。expand(rays_d.shape)是为了将这个位置扩展到和光线方向数组的形状一致，以便后续计算。
     rays_o = c2w[:3, -1].expand(rays_d.shape)

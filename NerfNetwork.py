@@ -59,11 +59,13 @@ class NeRF(nn.Module):
         h = F.relu(self.fc8(h))
         # 输出密度值
         density = self.fc_density(h)
+        density = F.relu(density)  # 将密度值限制在0以上
         # 输出RGB颜色值
         h = F.relu(self.fc_9(h))
         h = torch.cat([h, input_views], dim=-1)
         h = F.relu(self.fc_10(h))
         rgb = self.fc_rgb(h)
+        rgb = torch.sigmoid(rgb)  # 将RGB颜色值限制在0-1之间
         # ? 合并密度值和RGB颜色值
         output = torch.cat([rgb, density], dim=-1)
 

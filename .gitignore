@@ -11,3 +11,6 @@ wheels/
 
 # onnx
 *.onnx*
+
+# logs
+logs/
