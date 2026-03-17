@@ -14,10 +14,6 @@ from ReadData import load_blender_data
 from VolumeRendering import raw2outputs
 
 
-def mse2psnr(mse):
-	return -10.0 * torch.log10(mse)
-
-
 def format_seconds(seconds):
 	seconds = max(0, int(seconds))
 	hours = seconds // 3600
@@ -185,7 +181,28 @@ def train(args):
 		step_start = time.time()
 		# 随机选取一张图像，并从中随机选取args.n_rand条光线进行训练
 		img_i = np.random.choice(i_train)
-		select_inds = torch.randint(0, n_rays_per_image, (args.n_rand,), device=device)
+		
+		# 前500轮只从图像中心区域选择光线
+		if step <= args.precrop_iters:
+			center_h_ratio = 0.5  # 中心50%的高度
+			center_w_ratio = 0.5  # 中心50%的宽度
+			
+			h_start = int(H * (1 - center_h_ratio) / 2)
+			h_end = int(H * (1 + center_h_ratio) / 2)
+			w_start = int(W * (1 - center_w_ratio) / 2)
+			w_end = int(W * (1 + center_w_ratio) / 2)
+			
+			h_inds = torch.arange(h_start, h_end, device=device)
+			w_inds = torch.arange(w_start, w_end, device=device)
+			hh, ww = torch.meshgrid(h_inds, w_inds, indexing='ij')
+			
+			center_inds = (hh * W + ww).reshape(-1)
+			rand_idx = torch.randint(0, len(center_inds), (args.n_rand,), device=device)
+			select_inds = center_inds[rand_idx]
+		else:
+			# 500轮后从全图选择
+			select_inds = torch.randint(0, n_rays_per_image, (args.n_rand,), device=device)
+		
 		rays_o = rays_o_all[img_i, select_inds]
 		rays_d = rays_d_all[img_i, select_inds]
 		target_rgb = rgbs_all[img_i, select_inds]
@@ -205,9 +222,10 @@ def train(args):
 		)
         # 计算预测的RGB颜色值与目标RGB颜色值之间的均方误差损失，并计算PSNR值
 		loss_coarse = F.mse_loss(pred_rgb_coarse, target_rgb)
-		psnr_coarse = mse2psnr(loss_coarse.detach())
+		psnr_coarse = -10.0 * torch.log10(loss_coarse.detach())
+
 		loss_fine = F.mse_loss(pred_rgb_fine, target_rgb)
-		psnr_fine = mse2psnr(loss_fine.detach())
+		psnr_fine = -10.0 * torch.log10(loss_fine.detach())
         # 反向传播和优化
 		optimizer_coarse.zero_grad()
 		optimizer_fine.zero_grad()
@@ -276,18 +294,19 @@ if __name__ == "__main__":
 	args = SimpleNamespace(
 		datadir="./lego",
 		basedir="./logs",
-		n_iters=200001,  # 训练迭代次数，一次迭代中会随机选取一张图像进行训练，迭代次数越多，模型的拟合能力越强，但训练时间也会更长。
-		n_rand=1024,  # 每次迭代中随机选取的光线数量，通常是1024或2048。这个值越大，每次迭代的训练效果越好，但显存占用也会更高，训练时间也会更长。
-		n_samples=64,  # 每条光线上采样的点的数量，通常是64或128。这个值越大，模型的拟合能力越强，但显存占用也会更高，训练时间也会更长。
-		N_importance =128, # 每条光线的额外精细采样数量，即精细网络比粗网络多采样的点数
-		near=2.0,  # 近裁剪面距离，表示从相机出发的光线开始采样的起始位置。这个值应该根据场景的实际情况进行调整，通常设置为2.0或更大，以避免采样到相机内部的区域。
-		far=6.0,  # 远裁剪面距离，表示从相机出发的光线结束采样的位置。这个值应该根据场景的实际情况进行调整，通常设置为6.0或更大，以确保采样到场景中的所有物体。
-		multires=10,  # 位置编码的频率数量，通常是10或15。
-		multires_views=4,  # 视角编码的频率数量，通常是4或6。
+		n_iters=200001,  # 训练迭代次数，一次迭代中会随机选取一张图像进行训练。
+		n_rand=1024,  # 每次迭代中随机选取的光线数量。
+		precrop_iters=500,  # 预裁剪阶段的迭代次数。这个阶段只训练图像中心区域的光线，可以帮助模型更快地收敛。
+		n_samples=64,  # 每条光线上采样的点的数量。
+		N_importance=128, # 每条光线的额外精细采样数量，即精细网络比粗网络多采样的点数。
+		near=2.0,  # 近裁剪面距离，表示从相机出发的光线开始采样的起始位置。
+		far=6.0,  # 远裁剪面距离，表示从相机出发的光线结束采样的位置。
+		multires=10,  # 位置编码的频率数量。
+		multires_views=4,  # 视角编码的频率数量。
 		test_render_batch=4096,  # 渲染测试图时每次处理的光线数量，避免显存峰值过高。
-		lrate=5e-4,  # 初始学习率，通常是5e-4或1e-3。这个值越大，模型的收敛速度越快，但可能会导致训练不稳定；这个值越小，模型的收敛速度越慢，但训练更稳定。可以根据训练情况进行调整。
-		lrate_decay=250000,  # 学习率衰减的迭代次数，通常是250000或500000。这个值越大，学习率衰减得越慢，模型的拟合能力越强，但训练时间也会更长；这个值越小，学习率衰减得越快，模型的拟合能力越弱，但训练时间也会更短。可以根据训练情况进行调整。
-		i_print=100,  # 每隔多少迭代打印一次训练日志，通常是100或500。这个值越小，训练日志越详细，但会增加训练时间；这个值越大，训练日志越简洁，但可能会错过一些重要的训练信息。可以根据需要进行调整。
-		i_weights=5000,  # 每隔多少迭代保存一次模型权重，通常是5000或10000。这个值越小，模型权重保存得越频繁，可以更好地记录训练过程，但会占用更多的存储空间；这个值越大，模型权重保存得越不频繁，可以节省存储空间，但可能会错过一些重要的训练阶段。可以根据需要进行调整。
+		lrate=5e-4,  # 初始学习率。
+		lrate_decay=500000,  # 学习率衰减的迭代次数。
+		i_print=500,  # 每隔多少迭代打印一次训练日志。
+		i_weights=5000,  # 每隔多少迭代保存一次模型权重。
 	)
 	train(args)
