@@ -7,6 +7,7 @@ import imageio.v3 as iio
 import numpy as np
 import torch
 import torch.nn.functional as F
+from torch.utils.tensorboard import SummaryWriter
 
 from Embedder import positional_encoding
 from NerfNetwork import NeRF
@@ -163,130 +164,233 @@ def train(args):
 	optimizer_coarse = torch.optim.Adam(coarse_model.parameters(), lr=args.lrate)
 	fine_model = NeRF().to(device)
 	optimizer_fine = torch.optim.Adam(fine_model.parameters(), lr=args.lrate)
+
+	# 检查是否存在之前的训练检查点，如果存在则加载模型权重和优化器状态，以便继续训练。
+	ckpt_dir = args.basedir
+	start_step = 1
+	if os.path.exists(ckpt_dir):
+		coarse_steps = set()
+		fine_steps = set()
+		for file_name in os.listdir(ckpt_dir):
+			if file_name.startswith("coarse_") and file_name.endswith(".pth"):
+				step_str = file_name[len("coarse_"):-len(".pth")]
+				if step_str.isdigit():
+					coarse_steps.add(int(step_str))
+			elif file_name.startswith("fine_") and file_name.endswith(".pth"):
+				step_str = file_name[len("fine_"):-len(".pth")]
+				if step_str.isdigit():
+					fine_steps.add(int(step_str))
+
+		common_steps = coarse_steps & fine_steps
+		if common_steps:
+			last_step = max(common_steps)
+			coarse_ckpt_path = os.path.join(ckpt_dir, f"coarse_{last_step:06d}.pth")
+			fine_ckpt_path = os.path.join(ckpt_dir, f"fine_{last_step:06d}.pth")
+
+			coarse_ckpt = torch.load(coarse_ckpt_path, map_location=device)
+			coarse_model.load_state_dict(coarse_ckpt["model_state_dict"])
+			optimizer_coarse.load_state_dict(coarse_ckpt["optimizer_state_dict"])
+
+			fine_ckpt = torch.load(fine_ckpt_path, map_location=device)
+			fine_model.load_state_dict(fine_ckpt["model_state_dict"])
+			optimizer_fine.load_state_dict(fine_ckpt["optimizer_state_dict"])
+
+			start_step = int(last_step) + 1
+			print(f"Loaded checkpoint: coarse={coarse_ckpt_path}, fine={fine_ckpt_path}, resume_step={start_step}")
+
+
     # 创建日志文件夹和日志文件路径
 	os.makedirs(args.basedir, exist_ok=True)
 	preview_dir = os.path.join(args.basedir, "test_renders")
 	os.makedirs(preview_dir, exist_ok=True)
 	log_path = os.path.join(args.basedir, "train_log.txt")
+	tb_log_dir = os.path.join(args.basedir, "tensorboard")
+	writer = SummaryWriter(log_dir=tb_log_dir)
+	print(f"TensorBoard log dir: {tb_log_dir}")
 
 	i_test = i_split[2]
-	# 如果测试集不为空，则使用测试集的第一张图像进行测试渲染；如果测试集为空，则使用训练集的第一张图像进行测试渲染。
-	test_img_i = int(i_test[0]) if len(i_test) > 0 else int(i_train[0])
-	test_rays_o = rays_o_all[test_img_i]
-	test_rays_d = rays_d_all[test_img_i]
-    # 训练循环，迭代次数为args.n_iters，每次迭代随机选取一张图像进行训练
+	# 如果测试集为空，则使用训练集的第一张图像进行测试渲染。
+	if len(i_test) == 0:
+		i_test = np.array([int(i_train[0])])
+	# 训练循环，迭代次数为args.n_iters，每次迭代随机选取一张图像进行训练
 	recent_step_times = deque(maxlen=100)
 	t0 = time.time()
-	for step in range(1, args.n_iters + 1):
-		step_start = time.time()
-		# 随机选取一张图像，并从中随机选取args.n_rand条光线进行训练
-		img_i = np.random.choice(i_train)
-		
-		# 前500轮只从图像中心区域选择光线
-		if step <= args.precrop_iters:
-			center_h_ratio = 0.5  # 中心50%的高度
-			center_w_ratio = 0.5  # 中心50%的宽度
+	try:
+		for step in range(start_step, args.n_iters + 1):
+			step_start = time.time()
+			# 随机选取一张图像，并从中随机选取args.n_rand条光线进行训练
+			img_i = np.random.choice(i_train)
 			
-			h_start = int(H * (1 - center_h_ratio) / 2)
-			h_end = int(H * (1 + center_h_ratio) / 2)
-			w_start = int(W * (1 - center_w_ratio) / 2)
-			w_end = int(W * (1 + center_w_ratio) / 2)
+			# 前500轮只从图像中心区域选择光线
+			if step <= args.precrop_iters:
+				center_h_ratio = 0.5  # 中心50%的高度
+				center_w_ratio = 0.5  # 中心50%的宽度
+				
+				h_start = int(H * (1 - center_h_ratio) / 2)
+				h_end = int(H * (1 + center_h_ratio) / 2)
+				w_start = int(W * (1 - center_w_ratio) / 2)
+				w_end = int(W * (1 + center_w_ratio) / 2)
+				
+				h_inds = torch.arange(h_start, h_end, device=device)
+				w_inds = torch.arange(w_start, w_end, device=device)
+				hh, ww = torch.meshgrid(h_inds, w_inds, indexing='ij')
+				
+				center_inds = (hh * W + ww).reshape(-1)
+				rand_idx = torch.randint(0, len(center_inds), (args.n_rand,), device=device)
+				select_inds = center_inds[rand_idx]
+			else:
+				# 500轮后从全图选择
+				select_inds = torch.randint(0, n_rays_per_image, (args.n_rand,), device=device)
 			
-			h_inds = torch.arange(h_start, h_end, device=device)
-			w_inds = torch.arange(w_start, w_end, device=device)
-			hh, ww = torch.meshgrid(h_inds, w_inds, indexing='ij')
-			
-			center_inds = (hh * W + ww).reshape(-1)
-			rand_idx = torch.randint(0, len(center_inds), (args.n_rand,), device=device)
-			select_inds = center_inds[rand_idx]
-		else:
-			# 500轮后从全图选择
-			select_inds = torch.randint(0, n_rays_per_image, (args.n_rand,), device=device)
-		
-		rays_o = rays_o_all[img_i, select_inds]
-		rays_d = rays_d_all[img_i, select_inds]
-		target_rgb = rgbs_all[img_i, select_inds]
-        # 对选取的光线进行渲染，得到预测的RGB颜色值
-		pred_rgb_coarse, pred_rgb_fine = render_rays(
-			rays_o,
-			rays_d,
-			coarse_model,
-			fine_model,
-			near=args.near,
-			far=args.far,
-			n_samples=args.n_samples,
-			n_importance=args.N_importance,
-			multires=args.multires,
-			multires_views=args.multires_views,
-			white_bkgd=True,
-		)
-        # 计算预测的RGB颜色值与目标RGB颜色值之间的均方误差损失，并计算PSNR值
-		loss_coarse = F.mse_loss(pred_rgb_coarse, target_rgb)
-		psnr_coarse = -10.0 * torch.log10(loss_coarse.detach())
-
-		loss_fine = F.mse_loss(pred_rgb_fine, target_rgb)
-		psnr_fine = -10.0 * torch.log10(loss_fine.detach())
-        # 反向传播和优化
-		optimizer_coarse.zero_grad()
-		optimizer_fine.zero_grad()
-		total_loss = loss_coarse + loss_fine
-		total_loss.backward()
-		optimizer_coarse.step()
-		optimizer_fine.step()
-		recent_step_times.append(time.time() - step_start)
-        # 学习率衰减，按照指数衰减的方式调整学习率，衰减的速度由args.lrate_decay控制
-		new_lrate = args.lrate * (0.1 ** (step / args.lrate_decay))
-		for param_group in optimizer_coarse.param_groups:
-			param_group["lr"] = new_lrate
-		for param_group in optimizer_fine.param_groups:
-			param_group["lr"] = new_lrate
-        # 每隔args.i_print迭代打印一次训练日志，日志内容包括当前迭代次数、损失值、PSNR值、学习率和每次迭代的时间
-		if step % args.i_print == 0 or step == 1:
-			dt = time.time() - t0
-			steps_left = args.n_iters - step
-			avg_step_time = sum(recent_step_times) / len(recent_step_times)
-			eta_seconds = avg_step_time * steps_left
-			msg = (
-				f"[Step {step:06d}] Loss_coarse={loss_coarse.item():.6f} PSNR_coarse={psnr_coarse.item():.2f} "
-				f"Loss_fine={loss_fine.item():.6f} PSNR_fine={psnr_fine.item():.2f} "
-				f"LR={new_lrate:.6e} Time={dt:.2f}s ETA={format_seconds(eta_seconds)}"
+			rays_o = rays_o_all[img_i, select_inds]
+			rays_d = rays_d_all[img_i, select_inds]
+			target_rgb = rgbs_all[img_i, select_inds]
+			# 对选取的光线进行渲染，得到预测的RGB颜色值
+			pred_rgb_coarse, pred_rgb_fine = render_rays(
+				rays_o,
+				rays_d,
+				coarse_model,
+				fine_model,
+				near=args.near,
+				far=args.far,
+				n_samples=args.n_samples,
+				n_importance=args.N_importance,
+				multires=args.multires,
+				multires_views=args.multires_views,
+				white_bkgd=True,
 			)
-			print(msg)
-			with open(log_path, "a", encoding="utf-8") as f:
-				f.write(msg + "\n")
-			t0 = time.time()
+			# 计算预测的RGB颜色值与目标RGB颜色值之间的均方误差损失，并计算PSNR值
+			loss_coarse = F.mse_loss(pred_rgb_coarse, target_rgb)
+			psnr_coarse = -10.0 * torch.log10(loss_coarse.detach())
 
-		if step in (1, 5000, 10000, 20000, 50000, 100000, 150000, 200000):
-			was_coarse_model_training = coarse_model.training
-			was_fine_model_training = fine_model.training
+			loss_fine = F.mse_loss(pred_rgb_fine, target_rgb)
+			psnr_fine = -10.0 * torch.log10(loss_fine.detach())
+			# 反向传播和优化
+			optimizer_coarse.zero_grad()
+			optimizer_fine.zero_grad()
+			total_loss = loss_coarse + loss_fine
+			total_loss.backward()
+			optimizer_coarse.step()
+			optimizer_fine.step()
+			recent_step_times.append(time.time() - step_start)
+			writer.add_scalar("train/loss_coarse", loss_coarse.item(), step)
+			writer.add_scalar("train/loss_fine", loss_fine.item(), step)
+			writer.add_scalar("train/loss_total", total_loss.item(), step)
+			writer.add_scalar("train/psnr_coarse", psnr_coarse.item(), step)
+			writer.add_scalar("train/psnr_fine", psnr_fine.item(), step)
+			# 学习率衰减，按照指数衰减的方式调整学习率，衰减的速度由args.lrate_decay控制
+			new_lrate = args.lrate * (0.1 ** (step / args.lrate_decay))
+			for param_group in optimizer_coarse.param_groups:
+				param_group["lr"] = new_lrate
+			for param_group in optimizer_fine.param_groups:
+				param_group["lr"] = new_lrate
+			writer.add_scalar("train/lr", new_lrate, step)
+			writer.add_scalar("train/step_time", recent_step_times[-1], step)
+			# 每隔args.i_print迭代打印一次训练日志，日志内容包括当前迭代次数、损失值、PSNR值、学习率和每次迭代的时间
+			if step % args.i_print == 0 or step == 1:
+				dt = time.time() - t0
+				steps_left = args.n_iters - step
+				avg_step_time = sum(recent_step_times) / len(recent_step_times)
+				eta_seconds = avg_step_time * steps_left
+				msg = (
+					f"[Step {step:06d}] Loss_coarse={loss_coarse.item():.6f} PSNR_coarse={psnr_coarse.item():.2f} "
+					f"Loss_fine={loss_fine.item():.6f} PSNR_fine={psnr_fine.item():.2f} "
+					f"LR={new_lrate:.6e} Time={dt:.2f}s ETA={format_seconds(eta_seconds)}"
+				)
+				print(msg)
+				with open(log_path, "a", encoding="utf-8") as f:
+					f.write(msg + "\n")
+				t0 = time.time()
+			
+			# 每i_weights步迭代保存一次测试渲染结果，对所有测试集图像进行渲染。
+			if step !=0 and step % args.i_weights == 0 or step == args.n_iters:
+				# 记录当前模型的训练状态，以便渲染完成后恢复
+				was_coarse_model_training = coarse_model.training
+				was_fine_model_training = fine_model.training
 
-			coarse_model.eval()
-			fine_model.eval()
-			test_img_coarse, test_img_fine = render_test_image(coarse_model, fine_model, test_rays_o, test_rays_d, H, W, args)
-			if was_coarse_model_training:
-				coarse_model.train()
-			if was_fine_model_training:
-				fine_model.train()
+				# 切换到评估模式
+				coarse_model.eval()
+				fine_model.eval()
+				
+				# 用于统计所有测试图像的PSNR值
+				all_psnr_coarse = []
+				all_psnr_fine = []
+				
+				# 对所有测试图像进行渲染
+				for test_img_i in i_test:
+					test_img_i = int(test_img_i)
+					test_rays_o = rays_o_all[test_img_i]
+					test_rays_d = rays_d_all[test_img_i]
+					
+					test_img_coarse, test_img_fine = render_test_image(coarse_model, fine_model, test_rays_o, test_rays_d, H, W, args)
+					
+					# 保存粗网络的测试渲染结果
+					out_path = os.path.join(preview_dir, f"test_coarse_img_{test_img_i:03d}_step_{step:06d}.png")
+					iio.imwrite(out_path, (test_img_coarse.detach().cpu().numpy() * 255.0).astype(np.uint8))
+					print(f"Saved test render to {out_path}")
+					writer.add_image(f"test_render/coarse_img_{test_img_i}", test_img_coarse.permute(2, 0, 1), step)
 
-			out_path = os.path.join(preview_dir, f"test_coarse_step_{step:06d}.png")
-			iio.imwrite(out_path, (test_img_coarse.detach().cpu().numpy() * 255.0).astype(np.uint8))
-			print(f"Saved test render to {out_path}")
+					# 保存精细网络的测试渲染结果
+					out_path = os.path.join(preview_dir, f"test_fine_img_{test_img_i:03d}_step_{step:06d}.png")
+					iio.imwrite(out_path, (test_img_fine.detach().cpu().numpy() * 255.0).astype(np.uint8))
+					print(f"Saved test render to {out_path}")
+					writer.add_image(f"test_render/fine_img_{test_img_i}", test_img_fine.permute(2, 0, 1), step)
 
-			out_path = os.path.join(preview_dir, f"test_fine_step_{step:06d}.png")
-			iio.imwrite(out_path, (test_img_fine.detach().cpu().numpy() * 255.0).astype(np.uint8))
-			print(f"Saved test render to {out_path}")
-        # # 每隔args.i_weights迭代保存一次模型权重，保存的内容包括当前迭代次数、模型的状态字典和优化器的状态字典，保存的文件名包含当前迭代次数
-		# if step % args.i_weights == 0 or step == args.n_iters:
-		# 	ckpt_path = os.path.join(args.basedir, f"coarse_{step:06d}.pth")
-		# 	torch.save(
-		# 		{
-		# 			"global_step": step,
-		# 			"model_state_dict": coarse_model.state_dict(),
-		# 			"optimizer_state_dict": optimizer_coarse.state_dict(),
-		# 		},
-		# 		ckpt_path,
-		# 	)
-		# 	print(f"Saved checkpoint to {ckpt_path}")
+					# 计算测试图像的PSNR值
+					test_target_rgb = rgbs_all[test_img_i].reshape(-1, 3)
+					test_loss_coarse = F.mse_loss(test_img_coarse.reshape(-1, 3), test_target_rgb)
+					test_psnr_coarse = -10.0 * torch.log10(test_loss_coarse.detach())
+					test_loss_fine = F.mse_loss(test_img_fine.reshape(-1, 3), test_target_rgb)
+					test_psnr_fine = -10.0 * torch.log10(test_loss_fine.detach())
+					
+					all_psnr_coarse.append(test_psnr_coarse.item())
+					all_psnr_fine.append(test_psnr_fine.item())
+					
+					writer.add_scalar(f"test/psnr_coarse_img_{test_img_i}", test_psnr_coarse.item(), step)
+					writer.add_scalar(f"test/psnr_fine_img_{test_img_i}", test_psnr_fine.item(), step)
+				
+				# 统计所有测试图像的平均PSNR值
+				avg_psnr_coarse = np.mean(all_psnr_coarse)
+				avg_psnr_fine = np.mean(all_psnr_fine)
+				writer.add_scalar("test/avg_psnr_coarse", avg_psnr_coarse, step)
+				writer.add_scalar("test/avg_psnr_fine", avg_psnr_fine, step)
+				
+				# 打印统计信息
+				print(f"[Step {step:06d}] Test Images: {len(i_test)}")
+				print(f"  Coarse PSNR - Mean: {avg_psnr_coarse:.2f}, Min: {min(all_psnr_coarse):.2f}, Max: {max(all_psnr_coarse):.2f}")
+				print(f"  Fine PSNR   - Mean: {avg_psnr_fine:.2f}, Min: {min(all_psnr_fine):.2f}, Max: {max(all_psnr_fine):.2f}")
+				
+				# 恢复之前的训练模式
+				if was_coarse_model_training:
+					coarse_model.train()
+				if was_fine_model_training:
+					fine_model.train()
+			
+				ckpt_path = os.path.join(args.basedir, f"coarse_{step:06d}.pth")
+				torch.save(
+					{
+						"global_step": step,
+						"model_state_dict": coarse_model.state_dict(),
+						"optimizer_state_dict": optimizer_coarse.state_dict(),
+					},
+					ckpt_path,
+				)
+				# 保存精细网络的检查点
+				ckpt_path = os.path.join(args.basedir, f"fine_{step:06d}.pth")
+				torch.save(
+					{
+						"global_step": step,
+						"model_state_dict": fine_model.state_dict(),
+						"optimizer_state_dict": optimizer_fine.state_dict(),
+					},
+					ckpt_path,
+				)
+
+
+				print(f"Saved checkpoint to {ckpt_path}")
+	finally:
+		writer.flush()
+		writer.close()
 
 
 if __name__ == "__main__":
