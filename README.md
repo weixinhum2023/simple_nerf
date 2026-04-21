@@ -12,10 +12,7 @@ git clone https://github.com/weixinhum2023/simple_nerf
 cd simple_nerf\
 uv sync
 ```
-因为uv在Windows上的PyTorch包是不带GPU的版本，因此需要自行安装下PyTorch，这里直接下载最新版本(2.10.0)
-```bash
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
-```
+
 随后使用安装好的环境运行程序即可：
 ```bash
 uv run python train.py
